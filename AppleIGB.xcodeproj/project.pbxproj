@@ -379,7 +379,8 @@
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
 				SKIP_INSTALL = NO;
-				VALID_ARCHS = "i386 x86_64";
+				ARCHS = x86_64;
+				VALID_ARCHS = x86_64;
 			};
 			name = Debug;
 		};
@@ -422,7 +423,8 @@
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
 				SKIP_INSTALL = NO;
-				VALID_ARCHS = "i386 x86_64";
+				ARCHS = x86_64;
+				VALID_ARCHS = x86_64;
 			};
 			name = Release;
 		};

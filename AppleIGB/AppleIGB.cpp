@@ -9,6 +9,8 @@
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/assert.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <kern/clock.h>
 
 extern "C" {
 #include <sys/kpi_mbuf.h>
@@ -176,7 +178,8 @@ static void netif_stop_queue(IOEthernetController* netdev)
 static mbuf_t netdev_alloc_skb_ip_align(IOEthernetController* netdev, u16 rx_buffer_len)
 {
     mbuf_t skb = netdev->allocatePacket(rx_buffer_len);
-    mbuf_pkthdr_setlen(skb, 0);
+    if (skb)
+        mbuf_pkthdr_setlen(skb, 0);
 	return skb;
 }
 
@@ -463,6 +466,13 @@ u32 e1000_read_reg(struct e1000_hw *hw, u32 reg)
 		hw->hw_addr = NULL;
 		//netif_device_detach(netdev); @todo
 		pr_err("PCIe link lost, device now detached\n");
+		{
+			struct igb_adapter *igb = (struct igb_adapter *)hw->back;
+			if (igb && igb->netdev) {
+				igb->netdev->dbg.pcie_lost++;
+				igb->netdev->dbgEvent(kDbgEvPcieLost, reg);
+			}
+		}
 	}
 	
 	return value;
@@ -1967,6 +1977,8 @@ void igb_down(struct igb_adapter *adapter)
 	
 void igb_reinit_locked(struct igb_adapter *adapter)
 {
+	adapter->netdev->dbg.reinit++;
+	adapter->netdev->dbgEvent(kDbgEvReinit, 0);
 	WARN_ON(in_interrupt());
 	while (test_and_set_bit(__IGB_RESETTING, &adapter->state))
 		usleep_range(1000, 2000);
@@ -3678,6 +3690,9 @@ void igb_clean_rx_ring(struct igb_ring *rx_ring)
 		dev_kfree_skb(rx_ring->skb);
 #endif
 	rx_ring->skb = NULL;
+#ifdef __APPLE__
+	rx_ring->rx_discarding = false;
+#endif
 	
 	/* Free all the Rx ring sk_buffs */
 	for (i = 0; i < rx_ring->count; i++) {
@@ -6714,6 +6729,11 @@ static bool igb_clean_tx_irq(struct igb_q_vector *q_vector)
 				tx_buffer->time_stamp,
 				tx_buffer->next_to_watch,
 				tx_buffer->next_to_watch->wb.status);
+			{
+				AppleIGB *nd = tx_ring->netdev;
+				nd->dbg.tx_hang++;
+				nd->dbgEvent(kDbgEvTxHang, ((u32)tx_ring->next_to_use << 16) | tx_ring->next_to_clean);
+			}
 #ifdef	__APPLE__
 				netif_stop_queue(netdev_ring(tx_ring));
 #else
@@ -6893,6 +6913,8 @@ static bool igb_add_rx_frag(struct igb_ring *rx_ring,
         // Free it and signal the caller to drop this descriptor.
         rx_ring->netdev->freePacket(skb);
         rx_ring->rx_stats.alloc_failed++;
+        rx_ring->netdev->dbg.rx_cbfail++;
+        rx_ring->netdev->dbgEvent(kDbgEvRxCopyFail, size);
         return false;
     }
     return true;
@@ -6983,6 +7005,8 @@ static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
                                         IGB_RX_HDR_LEN);
         if (unlikely(!skb)) {
             rx_ring->rx_stats.alloc_failed++;
+            rx_ring->netdev->dbg.rx_alloc_fail++;
+            rx_ring->netdev->dbgEvent(kDbgEvRxAllocFail, 0);
             return NULL;
         }
         /*
@@ -7008,8 +7032,12 @@ static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
 	if (likely(igb_add_rx_frag(rx_ring, rx_buffer, rx_desc, skb))) {
 		igb_reuse_rx_page(rx_ring, rx_buffer);
 	} else {
-		/* igb_add_rx_frag already freed skb on mbuf_copyback failure */
+		/* igb_add_rx_frag already freed skb on mbuf_copyback failure.
+		 * The descriptor has been consumed: hand the (still valid) DMA page back
+		 * to the ring and discard the rest of this frame through EOP. */
+		igb_reuse_rx_page(rx_ring, rx_buffer);
 		rx_buffer->page = NULL;
+		rx_ring->rx_discarding = true;
 		return NULL;
 	}
 
@@ -7039,8 +7067,10 @@ static inline void igb_rx_checksum(struct igb_ring *ring,
 	//skb_checksum_none_assert(skb);
 
 	/* Ignore Checksum bit is set */
-	if (igb_test_staterr(rx_desc, E1000_RXD_STAT_IXSM))
+	if (igb_test_staterr(rx_desc, E1000_RXD_STAT_IXSM)) {
+		ring->netdev->dbg.rx_ixsm++;
 		return;
+	}
 
 	/* Rx checksum disabled via ethtool */
 	if (!(ring->netdev->features() & NETIF_F_RXCSUM))
@@ -7059,6 +7089,7 @@ static inline void igb_rx_checksum(struct igb_ring *ring,
 		      test_bit(IGB_RING_FLAG_RX_SCTP_CSUM, &ring->flags)))
 			ring->rx_stats.csum_err++;
 
+		ring->netdev->dbg.rx_csumerr++;
 		/* let the stack verify checksum errors */
 		return;
 	}
@@ -7074,6 +7105,8 @@ static inline void igb_rx_checksum(struct igb_ring *ring,
 	if (igb_test_staterr(rx_desc, (E1000_RXD_STAT_UDPCS))){
         flag |= IONetworkController::kChecksumUDP | CSUM_UDPIPv6;
     }
+    if (flag & IONetworkController::kChecksumIP) ring->netdev->dbg.rx_ipcs++;
+    if (flag & (IONetworkController::kChecksumTCP | IONetworkController::kChecksumUDP)) ring->netdev->dbg.rx_l4cs++;
     if(flag)
         ring->netdev->rxChecksumOK(skb, flag);
 #else
@@ -7382,12 +7415,36 @@ static bool igb_clean_rx_irq(struct igb_q_vector *q_vector, int budget)
 		 */
 		rmb();
 		
+		if (unlikely(rx_ring->rx_discarding)) {
+			/* a fragment of a frame whose copy failed earlier: consume it,
+			 * keep the page, and stop discarding at EOP */
+			struct igb_rx_buffer *rx_buffer = &rx_ring->rx_buffer_info[rx_ring->next_to_clean];
+			igb_reuse_rx_page(rx_ring, rx_buffer);
+			rx_buffer->page = NULL;
+			cleaned_count++;
+			if (igb_is_non_eop(rx_ring, rx_desc))
+				continue;
+			rx_ring->rx_discarding = false;
+			rx_ring->netdev->dbg.rx_drop++;
+			continue;
+		}
+
 		/* retrieve a buffer from the ring */
 		skb = igb_fetch_rx_buffer(rx_ring, rx_desc, skb);
 		
 		/* exit if we failed to retrieve a buffer */
-		if (!skb)
-			break;
+		if (!skb) {
+			if (!rx_ring->rx_discarding)
+				break;	/* mbuf allocation failed: descriptor not consumed, retry on the next poll */
+			/* copy failed: descriptor and page were consumed; drop the remaining
+			 * fragments of this frame through EOP */
+			cleaned_count++;
+			if (igb_is_non_eop(rx_ring, rx_desc))
+				continue;
+			rx_ring->rx_discarding = false;
+			rx_ring->netdev->dbg.rx_drop++;
+			continue;
+		}
         
 		cleaned_count++;
 		
@@ -7397,12 +7454,14 @@ static bool igb_clean_rx_irq(struct igb_q_vector *q_vector, int budget)
 		
 		/* verify the packet layout is correct */
 		if (igb_cleanup_headers(rx_ring, rx_desc, skb)) {
+			rx_ring->netdev->dbg.rx_drop++;
 			skb = NULL;
 			continue;
 		}
 
 		/* probably a little skewed due to removing CRC */
 #ifdef __APPLE__
+		rx_ring->netdev->dbgCountEtherType(skb, false);
 		total_bytes += mbuf_pkthdr_len(skb);
 #else
 		total_bytes += skb->len;
@@ -9092,6 +9151,12 @@ bool AppleIGB::init(OSDictionary *properties)
 	enabledForNetif = false;
     workLoop = NULL;
     txLock = IOSimpleLockAlloc();
+    bzero(&dbg, sizeof(dbg));
+    bzero(dbgEvents, sizeof(dbgEvents));
+    dbgEvHead = 0;
+    dbgLastPublish = 0;
+    interruptMode = kIntrModeLegacy;
+    interruptIndex = 0;
 
 	pdev = NULL;
 	mediumDict = NULL;
@@ -9802,6 +9867,43 @@ static void igb_remove_i2c(struct igb_adapter *adapter)
 #endif /* HAVE_I2C_SUPPORT */
 
 //---------------------------------------------------------------------------
+/* Boot-arg lookup without pexpert: the booter leaves boot-args in IODeviceTree:/options,
+ * which only needs the IOKit KPI this kext already links against. Returns true when
+ * "name" or "name=<non-zero>" is present. */
+static bool igb_boot_arg_set(const char *name)
+{
+    bool found = false;
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (!options)
+        return false;
+    OSObject *obj = options->getProperty("boot-args");
+    const char *args = NULL;
+    size_t len = 0;
+    if (OSData *d = OSDynamicCast(OSData, obj)) {
+        args = (const char *)d->getBytesNoCopy();
+        len = d->getLength();
+    } else if (OSString *s = OSDynamicCast(OSString, obj)) {
+        args = s->getCStringNoCopy();
+        len = s->getLength();
+    }
+    if (args) {
+        size_t nlen = strlen(name);
+        for (size_t i = 0; i + nlen <= len && args[i]; i++) {
+            if ((i == 0 || args[i - 1] == ' ') && strncmp(args + i, name, nlen) == 0) {
+                char c = (i + nlen < len) ? args[i + nlen] : 0;
+                if (c == 0 || c == ' ')
+                    found = true;
+                else if (c == '=')
+                    found = (i + nlen + 1 < len) && args[i + nlen + 1] != '0';
+                if (found)
+                    break;
+            }
+        }
+    }
+    options->release();
+    return found;
+}
+
 bool AppleIGB::initEventSources( IOService* provider )
 {
     bool result = false;
@@ -9827,25 +9929,42 @@ bool AppleIGB::initEventSources( IOService* provider )
 	}
     transmitQueue->retain();
 
-#ifdef MSIX_ENABLED
-    while (pdev->getInterruptType(intrIndex, &intrType) == kIOReturnSuccess) {
-        if (intrType & kIOInterruptTypePCIMessaged){
-            msiIndex = intrIndex;
-            break;
+/* Interrupt source. Prefer the PCI message-signalled vector (MSI). The legacy
+     * INTx line is shared and level-triggered; the sibling AppleIGC driver traced
+     * its "link up, no traffic after a while" stalls to it. Boot-arg igb-intx=1
+     * forces the legacy line so both modes can be A/B tested with one binary. */
+    {
+        int intrIndex = 0, intrType = 0, msiIndex = -1;
+        UInt32 forceIntx = igb_boot_arg_set("igb-intx") ? 1 : 0;
+        if (!forceIntx) {
+            while (pdev->getInterruptType(intrIndex, &intrType) == kIOReturnSuccess) {
+                if (intrType & kIOInterruptTypePCIMessaged) {
+                    msiIndex = intrIndex;
+                    break;
+                }
+                intrIndex++;
+            }
         }
-        intrIndex++;
-    }
-
-    if (msiIndex != -1) {
-        pr_err("MSI interrupt index: %d\n", msiIndex);
-        interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &AppleIGB::interruptOccurred), provider, msiIndex);
-    }
-#endif
-
-    interruptSource = IOInterruptEventSource::interruptEventSource(this,&AppleIGB::interruptHandler,provider);
-    if (!interruptSource) {
-        pr_err("MSI interrupt could not be enabled.\n");
-        goto error1;
+        interruptMode = kIntrModeLegacy;
+        interruptIndex = 0;
+        if (msiIndex >= 0) {
+            interruptSource = IOInterruptEventSource::interruptEventSource(this, &AppleIGB::interruptHandler, provider, msiIndex);
+            if (interruptSource) {
+                interruptMode = kIntrModeMSI;
+                interruptIndex = msiIndex;
+            } else {
+                pr_err("MSI interrupt source (index %d) could not be created, falling back to legacy INTx\n", msiIndex);
+            }
+        }
+        if (!interruptSource)
+            interruptSource = IOInterruptEventSource::interruptEventSource(this, &AppleIGB::interruptHandler, provider);
+        if (!interruptSource) {
+            pr_err("Interrupt source could not be created.\n");
+            goto error1;
+        }
+        pr_err("Interrupt mode: %s (index %d%s)\n", interruptMode == kIntrModeMSI ? "MSI" : "legacy INTx",
+               interruptIndex, forceIntx ? ", forced by igb-intx" : "");
+        dbgEvent(kDbgEvIrqMode, ((UInt32)interruptMode << 8) | (UInt32)interruptIndex | (forceIntx ? 0x10000 : 0));
     }
     getWorkLoop()->addEventSource(interruptSource);
 
@@ -9885,6 +10004,7 @@ IOReturn AppleIGB::enable(IONetworkInterface * netif)
     struct e1000_hw *hw = &priv_adapter.hw;
     int ret_val;
 	pr_err("enable() ===>\n");
+    dbgEvent(kDbgEvEnable, enabledForNetif ? 1 : 0);
 	if(!enabledForNetif){
 		pdev->open(this);
 
@@ -9939,6 +10059,7 @@ IOReturn AppleIGB::enable(IONetworkInterface * netif)
 IOReturn AppleIGB::disable(IONetworkInterface * netif)
 {
     pr_err("disable() ===>\n");
+    dbgEvent(kDbgEvDisable, enabledForNetif ? 1 : 0);
 
 	if(enabledForNetif){
 		enabledForNetif = false;
@@ -10162,6 +10283,7 @@ void AppleIGB::setLinkUp()
     pr_debug("[LU]: TXDCTL(1)=0x%08x\n", E1000_READ_REG(hw, E1000_TXDCTL(1)));
     pr_debug("[LU]: EEE Active %u\n", (E1000_READ_REG(hw, E1000_EEER) & E1000_EEER_EEE_NEG));
 
+    dbgEvent(kDbgEvLinkUp, (UInt32)adapter->link_speed | ((UInt32)adapter->link_duplex << 16));
     pr_err("setLinkUp() <===\n");
 }
 
@@ -10192,6 +10314,7 @@ void AppleIGB::systemWillShutdown(IOOptionBits specifier)
  */
 void AppleIGB::setLinkDown()
 {
+        dbgEvent(kDbgEvLinkDown, 0);
         struct e1000_hw *hw = &priv_adapter.hw;
         struct igb_adapter *adapter = &priv_adapter;
 
@@ -10216,10 +10339,12 @@ UInt32 AppleIGB::outputPacket(mbuf_t skb, void * param)
 {
 	struct igb_adapter *adapter = &priv_adapter;
     UInt32 result = kIOReturnOutputDropped;
+    dbgCountEtherType(skb, true);
 	
     if (unlikely(!(enabledForNetif && linkUp) || !txMbufCursor
             || test_bit(__IGB_DOWN, &adapter->state))) {
         pr_debug("output: Dropping packet on disabled device\n");
+        dbg.tx_drop++;
         goto error;
 	}
 
@@ -10251,6 +10376,9 @@ UInt32 AppleIGB::outputPacket(mbuf_t skb, void * param)
                 pr_debug("output: Dropping packets (%u), free\n", netStats->outputErrors);
 #endif
             result = kIOReturnOutputStall;
+            dbg.tx_stall++;
+            if (!stalled)
+                dbgEvent(kDbgEvTxStall, (UInt32)txNumFreeDesc);
             stalled = true;
             goto done;
         }
@@ -10305,6 +10433,10 @@ UInt32 AppleIGB::outputPacket(mbuf_t skb, void * param)
         if(!igb_tx_map(tx_ring, first, hdr_len)){
 			netStats->outputErrors += 1;
             pr_debug("output: igb_tx_map failed (%u)\n", netStats->outputErrors);
+            /* nothing was mapped: clear the slot so igb_clean_tx_ring cannot free this mbuf a second time */
+            first->skb = NULL;
+            first->next_to_watch = NULL;
+            dbg.tx_map_fail++;
             IOSimpleLockUnlock(txLock);
             goto error;
 		}
@@ -10540,6 +10672,8 @@ void AppleIGB::intelSetupAdvForMedium(const IONetworkMedium *medium)
          * From IntelMausi
          */
 void AppleIGB::intelRestart() {
+        dbg.restart++;
+        dbgEvent(kDbgEvRestart, (linkUp ? 1 : 0) | (carrier() ? 2 : 0));
         struct igb_adapter *adapter = &priv_adapter;
 
         pr_debug("intelRestart ===> on en%u, linkUp=%u, carrier=%u\n",
@@ -10832,6 +10966,8 @@ void AppleIGB::checkLinkStatus()
 
     /* Now check the link state. */
     link = intelCheckLink(adapter);
+    dbg.link_check++;
+    dbgEvent(kDbgEvLinkCheck, (link ? 1 : 0) | (carrier() ? 2 : 0) | (linkUp ? 4 : 0));
 
     pr_debug("checkLinkStatus() ===> link=%u, carrier=%u, linkUp=%u\n",
              link, carrier(), linkUp);
@@ -10898,23 +11034,30 @@ void AppleIGB::interruptOccurred(IOInterruptEventSource * src, int count)
 	struct igb_q_vector *q_vector = adapter->q_vector[0];
 	struct e1000_hw *hw = &adapter->hw;
 
-    /* Interrupt Auto-Mask...upon reading ICR, interrupts are masked.  No
-         * need for the IMC write */
+    /* Reading ICR clears it. */
     u32 icr = E1000_READ_REG(hw, E1000_ICR);
 
+    dbg.irq_count++;
+    dbg.last_icr = icr;
+
     if(!enabledForNetif) {
+        dbg.irq_on_disabled++;
         pr_debug("Interrupt 0x%08x on disabled device\n", icr);
         return;
     }
 
-	/* IMS will not auto-mask if INT_ASSERTED is not set, and if it is
-	 * not set, then the adapter didn't send an interrupt */
-	if (!(icr & E1000_ICR_INT_ASSERTED))
+	/* On the shared legacy INTx line INT_ASSERTED tells whether this adapter
+	 * raised the interrupt at all. With MSI the message identifies the source
+	 * and the bit is not required; gating on it discards real interrupts. */
+	if (interruptMode == kIntrModeLegacy && !(icr & E1000_ICR_INT_ASSERTED)) {
+        dbg.irq_spurious++;
 		return;
-	
+    }
+
 	igb_write_itr(q_vector);
-	
+
     if (icr & E1000_ICR_DRSTA) {
+        dbgEvent(kDbgEvDrsta, icr);
         resetSource->setTimeoutMS(1);
     }
 
@@ -10922,16 +11065,19 @@ void AppleIGB::interruptOccurred(IOInterruptEventSource * src, int count)
 		/* HW is reporting DMA is out of sync */
 		adapter->stats.doosync++;
 	}
-	
-	if (unlikely(icr & (E1000_ICR_RXSEQ | E1000_ICR_LSC))) {
-        checkLinkStatus();
-//
-//		/* guard against interrupt when we're going down */
-//		if (!test_bit(__IGB_DOWN, &adapter->state))
-//			watchdogSource->setTimeoutMS(1);
-    } else {
+
+    /* Always service the rings first. RX/TX work that arrived in the same ICR
+     * read as a link event used to wait for the next interrupt. */
+    if (!test_bit(__IGB_DOWN, &adapter->state)) {
+        dbg.poll_count++;
         igb_poll(q_vector, 64);
     }
+
+	if (unlikely(icr & (E1000_ICR_RXSEQ | E1000_ICR_LSC))) {
+        checkLinkStatus();
+    }
+
+    dbgPublish(false);
 }
 
 void AppleIGB::interruptHandler(OSObject * target, IOInterruptEventSource * src, int count)
@@ -10944,6 +11090,7 @@ void AppleIGB::interruptHandler(OSObject * target, IOInterruptEventSource * src,
 // corresponds to igb_watchdog_task	
 void AppleIGB::watchdogTask()
 {
+	dbg.watchdog_ticks++;
 	struct igb_adapter *adapter = &priv_adapter;
 	struct e1000_hw *hw = &adapter->hw;
 	int i;
@@ -10976,6 +11123,7 @@ void AppleIGB::watchdogTask()
         }
 	}
 
+    dbgPublish(false);
     watchdogSource->setTimeoutMS(200);
 }
 
@@ -11113,6 +11261,8 @@ UInt32 AppleIGB::getFeatures() const {
 
 void AppleIGB::startTxQueue()
 {
+    dbg.tx_wake++;
+    dbgEvent(kDbgEvTxWake, stalled ? 1 : 0);
     DEBUGFUNC("AppleIGB::startTxQueue\n");
     if (likely(stalled && txMbufCursor && transmitQueue)) {
         pr_debug("Assuming wake queue called.\n");
@@ -11146,6 +11296,8 @@ bool AppleIGB::carrier()
 	
 void AppleIGB::setCarrier(bool stat)
 {
+    if (stat) dbg.carrier_up++; else dbg.carrier_down++;
+    dbgEvent(stat ? kDbgEvCarrierUp : kDbgEvCarrierDown, preLinkStatus);
     pr_debug("setCarrier(%d) ===>\n", stat);
 	if(stat){
 		preLinkStatus = kIONetworkLinkValid | kIONetworkLinkActive;
@@ -11203,3 +11355,121 @@ void AppleIGB::setTimers(bool enable)
     }
 }
    
+
+/* ------------------------------------------------------------------------
+ * Diagnostics: counters and an event ring published in the IORegistry.
+ * Read with:  ioreg -r -c AppleIGB -l | grep -E 'AppleIGB-(DBG|Events)'
+ * ---------------------------------------------------------------------- */
+
+static const char *igb_dbg_event_names[kDbgEvCount] = {
+    "NONE", "IRQ_MODE", "LINK_UP", "LINK_DOWN", "CARRIER_UP", "CARRIER_DOWN", "RESTART", "REINIT",
+    "TX_HANG", "TX_STALL", "TX_WAKE", "RX_COPY_FAIL", "RX_ALLOC_FAIL", "PCIE_LOST", "DRSTA",
+    "LINK_CHECK", "ENABLE", "DISABLE", "WATCHDOG_OFF", "IRQ_ON_DISABLED", "IRQ_SPURIOUS"
+};
+
+static UInt64 igb_dbg_now_us()
+{
+    clock_sec_t secs;
+    clock_usec_t usecs;
+    clock_get_calendar_microtime(&secs, &usecs);
+    return (UInt64)secs * 1000000ULL + (UInt64)usecs;
+}
+
+void AppleIGB::dbgEvent(UInt16 code, UInt32 arg)
+{
+    UInt64 now = igb_dbg_now_us();
+    if (dbgEvHead > 0) {
+        struct igb_dbg_event *last = &dbgEvents[(dbgEvHead - 1) % IGB_DBG_EVENTS];
+        /* fold bursts of the same event into one entry */
+        if (last->code == code && last->arg == arg && now - last->t_us < 1000000ULL && last->repeat < 0xFFFF) {
+            last->repeat++;
+            return;
+        }
+    }
+    struct igb_dbg_event *e = &dbgEvents[dbgEvHead % IGB_DBG_EVENTS];
+    e->t_us = now;
+    e->code = code;
+    e->arg = arg;
+    e->repeat = 0;
+    dbgEvHead++;
+    dbgPublish(code == kDbgEvPcieLost || code == kDbgEvTxHang || code == kDbgEvRestart ||
+               code == kDbgEvLinkDown || code == kDbgEvLinkUp || code == kDbgEvIrqMode);
+}
+
+void AppleIGB::dbgCountEtherType(mbuf_t skb, bool tx)
+{
+    UInt16 et = 0;
+    if (skb && mbuf_len(skb) >= 14) {
+        const u8 *d = (const u8 *)mbuf_data(skb);
+        et = (UInt16)((d[12] << 8) | d[13]);
+    }
+    if (tx) {
+        if (et == 0x0800) dbg.tx_v4++; else if (et == 0x86DD) dbg.tx_v6++; else if (et == 0x0806) dbg.tx_arp++; else dbg.tx_oth++;
+    } else {
+        if (et == 0x0800) dbg.rx_v4++; else if (et == 0x86DD) dbg.rx_v6++; else if (et == 0x0806) dbg.rx_arp++; else dbg.rx_oth++;
+    }
+}
+
+void AppleIGB::dbgPublish(bool force)
+{
+    UInt64 now = mach_absolute_time();
+    UInt64 ns = 0;
+    if (dbgLastPublish)
+        absolutetime_to_nanoseconds(now - dbgLastPublish, &ns);
+    if (!force && dbgLastPublish && ns < 1000000000ULL)
+        return;
+    dbgLastPublish = now;
+
+    struct igb_adapter *adapter = &priv_adapter;
+    OSDictionary *d = OSDictionary::withCapacity(64);
+    if (!d)
+        return;
+#define DBGSET(name, val) do { OSNumber *n_ = OSNumber::withNumber((unsigned long long)(val), 64); if (n_) { d->setObject(name, n_); n_->release(); } } while (0)
+    DBGSET("irq_mode", interruptMode); DBGSET("irq_index", interruptIndex);
+    DBGSET("irq_count", dbg.irq_count); DBGSET("irq_spurious", dbg.irq_spurious); DBGSET("irq_on_disabled", dbg.irq_on_disabled);
+    DBGSET("last_icr", dbg.last_icr); DBGSET("poll_count", dbg.poll_count); DBGSET("watchdog_ticks", dbg.watchdog_ticks);
+    DBGSET("rx_v4", dbg.rx_v4); DBGSET("rx_v6", dbg.rx_v6); DBGSET("rx_arp", dbg.rx_arp); DBGSET("rx_oth", dbg.rx_oth);
+    DBGSET("rx_drop", dbg.rx_drop); DBGSET("rx_cbfail", dbg.rx_cbfail); DBGSET("rx_alloc_fail", dbg.rx_alloc_fail);
+    DBGSET("rx_csumerr", dbg.rx_csumerr); DBGSET("rx_ixsm", dbg.rx_ixsm); DBGSET("rx_ipcs", dbg.rx_ipcs); DBGSET("rx_l4cs", dbg.rx_l4cs);
+    DBGSET("tx_v4", dbg.tx_v4); DBGSET("tx_v6", dbg.tx_v6); DBGSET("tx_arp", dbg.tx_arp); DBGSET("tx_oth", dbg.tx_oth);
+    DBGSET("tx_drop", dbg.tx_drop); DBGSET("tx_stall", dbg.tx_stall); DBGSET("tx_wake", dbg.tx_wake); DBGSET("tx_hang", dbg.tx_hang); DBGSET("tx_map_fail", dbg.tx_map_fail);
+    DBGSET("carrier_up", dbg.carrier_up); DBGSET("carrier_down", dbg.carrier_down); DBGSET("link_check", dbg.link_check);
+    DBGSET("restart", dbg.restart); DBGSET("reinit", dbg.reinit); DBGSET("pcie_lost", dbg.pcie_lost);
+    DBGSET("stalled", stalled ? 1 : 0); DBGSET("linkUp", linkUp ? 1 : 0); DBGSET("enabled", enabledForNetif ? 1 : 0);
+    DBGSET("hw_gprc", adapter->stats.gprc); DBGSET("hw_gptc", adapter->stats.gptc); DBGSET("hw_mpc", adapter->stats.mpc);
+    DBGSET("hw_rnbc", adapter->stats.rnbc); DBGSET("hw_crcerrs", adapter->stats.crcerrs); DBGSET("hw_rxerrc", adapter->stats.rxerrc);
+    DBGSET("hw_ruc", adapter->stats.ruc); DBGSET("hw_roc", adapter->stats.roc); DBGSET("hw_rlec", adapter->stats.rlec);
+    DBGSET("hw_algnerrc", adapter->stats.algnerrc); DBGSET("hw_bprc", adapter->stats.bprc); DBGSET("hw_mprc", adapter->stats.mprc);
+    DBGSET("hw_doosync", adapter->stats.doosync);
+    if (enabledForNetif && adapter->rx_ring[0] && adapter->tx_ring[0]) {
+        struct igb_ring *rx_ring = adapter->rx_ring[0];
+        struct igb_ring *tx_ring = adapter->tx_ring[0];
+        DBGSET("rx_ring_ntc", rx_ring->next_to_clean); DBGSET("rx_ring_ntu", rx_ring->next_to_use);
+        DBGSET("rx_ring_unused", igb_desc_unused(rx_ring)); DBGSET("rx_ring_alloc_failed", rx_ring->rx_stats.alloc_failed);
+        DBGSET("tx_ring_ntc", tx_ring->next_to_clean); DBGSET("tx_ring_ntu", tx_ring->next_to_use);
+        DBGSET("tx_ring_unused", igb_desc_unused(tx_ring)); DBGSET("tx_ring_restart_queue", tx_ring->tx_stats.restart_queue);
+    }
+    DBGSET("published_at_us", igb_dbg_now_us());
+#undef DBGSET
+    setProperty("AppleIGB-DBG", d);
+    d->release();
+
+    OSArray *arr = OSArray::withCapacity(IGB_DBG_EVENTS);
+    if (arr) {
+        UInt32 n = dbgEvHead < IGB_DBG_EVENTS ? dbgEvHead : IGB_DBG_EVENTS;
+        UInt32 start = dbgEvHead - n;
+        char buf[96];
+        for (UInt32 k = 0; k < n; k++) {
+            const struct igb_dbg_event *e = &dbgEvents[(start + k) % IGB_DBG_EVENTS];
+            const char *name = e->code < kDbgEvCount ? igb_dbg_event_names[e->code] : "?";
+            if (e->repeat)
+                snprintf(buf, sizeof(buf), "%llu.%06llu %s 0x%08x x%u", e->t_us / 1000000ULL, e->t_us % 1000000ULL, name, e->arg, (unsigned)e->repeat + 1);
+            else
+                snprintf(buf, sizeof(buf), "%llu.%06llu %s 0x%08x", e->t_us / 1000000ULL, e->t_us % 1000000ULL, name, e->arg);
+            OSString *s = OSString::withCString(buf);
+            if (s) { arr->setObject(s); s->release(); }
+        }
+        setProperty("AppleIGB-Events", arr);
+        arr->release();
+    }
+}

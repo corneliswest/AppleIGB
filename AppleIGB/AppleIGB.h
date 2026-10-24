@@ -47,6 +47,37 @@ enum {
     kEEETypeCount
 };
 
+/* Interrupt delivery mode chosen in initEventSources(). */
+enum {
+    kIntrModeLegacy = 0,    /* shared level-triggered INTx line */
+    kIntrModeMSI = 1        /* PCI message-signalled interrupt */
+};
+
+/* Diagnostics: event codes recorded in the AppleIGB-Events ring (see dbgEvent()). */
+enum {
+    kDbgEvNone = 0, kDbgEvIrqMode, kDbgEvLinkUp, kDbgEvLinkDown, kDbgEvCarrierUp, kDbgEvCarrierDown,
+    kDbgEvRestart, kDbgEvReinit, kDbgEvTxHang, kDbgEvTxStall, kDbgEvTxWake, kDbgEvRxCopyFail,
+    kDbgEvRxAllocFail, kDbgEvPcieLost, kDbgEvDrsta, kDbgEvLinkCheck, kDbgEvEnable, kDbgEvDisable,
+    kDbgEvWatchdogOff, kDbgEvIrqOnDisabled, kDbgEvIrqSpurious,
+    kDbgEvCount
+};
+
+#define IGB_DBG_EVENTS 128
+
+struct igb_dbg_counters {
+    UInt32 irq_count, irq_spurious, irq_on_disabled, last_icr, poll_count, watchdog_ticks;
+    UInt32 rx_v4, rx_v6, rx_arp, rx_oth, rx_drop, rx_cbfail, rx_alloc_fail, rx_csumerr, rx_ixsm, rx_ipcs, rx_l4cs;
+    UInt32 tx_v4, tx_v6, tx_arp, tx_oth, tx_drop, tx_stall, tx_wake, tx_hang, tx_map_fail;
+    UInt32 carrier_up, carrier_down, link_check, restart, reinit, pcie_lost;
+};
+
+struct igb_dbg_event {
+    UInt64 t_us;        /* wall clock, microseconds since the epoch */
+    UInt32 arg;
+    UInt16 code;
+    UInt16 repeat;      /* consecutive identical events folded into one entry */
+};
+
 #define super IOEthernetController
 
 class AppleIGB: public super
@@ -111,6 +142,13 @@ public:
     virtual UInt32 getFeatures() const;
     IOSimpleLock* getTxLock() const { return txLock; }
 
+    // Diagnostics, published in the IORegistry as "AppleIGB-DBG" and "AppleIGB-Events"
+    // (ioreg -r -c AppleIGB -l). Counters are best-effort and not locked.
+    struct igb_dbg_counters dbg;
+    void dbgEvent(UInt16 code, UInt32 arg);
+    void dbgCountEtherType(mbuf_t skb, bool tx);
+    void dbgPublish(bool force);
+
 private:
 	IOWorkLoop* workLoop;
 	IOSimpleLock* txLock;   // protects TX ring between outputPacket and igb_clean_tx_irq
@@ -120,6 +158,11 @@ private:
 	IOOutputQueue * transmitQueue;
 	
 	IOInterruptEventSource * interruptSource;
+	int interruptMode;      /* kIntrModeLegacy / kIntrModeMSI */
+	int interruptIndex;     /* provider interrupt index in use */
+	struct igb_dbg_event dbgEvents[IGB_DBG_EVENTS];
+	UInt32 dbgEvHead;
+	UInt64 dbgLastPublish;
 	IOTimerEventSource * watchdogSource;
 	IOTimerEventSource * resetSource;
 	IOTimerEventSource * dmaErrSource;

@@ -409,6 +409,9 @@ struct igb_ring {
 			u16 rx_buffer_len;
 #else
 			struct sk_buff *skb;
+#ifdef __APPLE__
+			bool rx_discarding;	/* drop the rest of a frame whose copy failed, through EOP */
+#endif
 #endif
 		};
 	};
