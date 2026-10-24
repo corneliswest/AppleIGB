@@ -10,7 +10,7 @@ Bundle id stays `com.amdosx.driver.AppleIGB`; installed on the EFI as `AppleIGB-
 | 5 | 5.11.41 | + MBUF_DONTWAIT | IPv4 stalls after ~3 min |
 | 6 | 5.11.42 | + IOLog counters | dropouts after 2.5 min; logs undecodable |
 | 7 | 5.11.43 | + IORegistry counters | clean 10 min; stalled again on Oct 24 (3x) |
-| 8 | 5.12.0 | **MSI interrupts** (was legacy INTx), event ring, latent RX/TX fixes | pending |
+| 8 | 5.12.0 | **MSI interrupts** (was legacy INTx), event ring, latent RX/TX fixes | installed on the EFI 2026-10-24 23:1x (SHA-256 b7085a93…); backup `EFI/OC/AppleIGB-Tahoe-5.11.43.kext.bak`; result pending |
 
 ## 5.12.0 (test 8)
 - Interrupts: use the PCI message-signalled (MSI) vector instead of the legacy INTx line; boot-arg `igb-intx=1` forces the old behaviour for A/B tests. The `INT_ASSERTED` gate only applies in INTx mode.

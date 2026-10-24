@@ -12,12 +12,14 @@ EFI=$(mount | sed -n 's|^/dev/disk0s1 on \(.*\) (msdos.*|\1|p')
 OC="$EFI/EFI/OC"; CFG="$OC/config.plist"; DST="$OC/Kexts/AppleIGB-Tahoe.kext"
 [ -f "$CFG" ] || { echo "no config.plist at $CFG"; exit 1; }
 [ -d "$DST" ] || { echo "no $DST on the EFI"; exit 1; }
-plutil -convert json -o - "$CFG" | python3 -I -c '
-import json, sys
-j = json.load(sys.stdin)
+python3 -I - "$CFG" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    j = plistlib.load(f)
 e = [k for k in j["Kernel"]["Add"] if k.get("BundlePath") == "AppleIGB-Tahoe.kext"]
 assert len(e) == 1 and e[0].get("Enabled") and e[0].get("MinKernel") == "25.0.0", e
-print("config entry OK:", e[0].get("Comment", ""), "| MinKernel", e[0]["MinKernel"])'
+print("config entry OK:", e[0].get("Comment", ""), "| MinKernel", e[0]["MinKernel"])
+PY
 OLDV=$(plutil -extract CFBundleVersion raw -o - "$DST/Contents/Info.plist")
 NEWV=$(plutil -extract CFBundleVersion raw -o - "$K/Contents/Info.plist")
 echo "installed $OLDV -> new $NEWV   (EFI free: $(df -k "$EFI" | awk 'NR==2{print $4}') KB)"
