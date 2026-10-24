@@ -5430,10 +5430,14 @@ void igb_update_stats(struct igb_adapter *adapter)
 	/* RLEC on some newer hardware can be incorrect so build
 	 * our own version based on RUC and ROC
 	 */
+	/* IONetworkInterface treats any decrease of these counters as a 32-bit wrap and
+	 * adds 2^32 to the ifnet statistics (netstat showed Oerrs as multiples of 2^32),
+	 * so only monotonic hardware and driver counters are summed here and the packet
+	 * paths no longer write them directly. */
 	net_stats->inputErrors = (u32)(adapter->stats.rxerrc +
         adapter->stats.crcerrs + adapter->stats.algnerrc +
         adapter->stats.ruc + adapter->stats.roc +
-        adapter->stats.cexterr);
+        adapter->stats.cexterr + adapter->netdev->dbg.rx_drop);
 	ether_stats->dot3StatsEntry.frameTooLongs = (u32)adapter->stats.roc;
 	ether_stats->dot3RxExtraEntry.frameTooShorts = (u32)adapter->stats.ruc;
 	ether_stats->dot3StatsEntry.fcsErrors = (u32)adapter->stats.crcerrs;
@@ -5441,7 +5445,8 @@ void igb_update_stats(struct igb_adapter *adapter)
 	ether_stats->dot3StatsEntry.missedFrames = (u32)adapter->stats.mpc;
 	
 	/* Tx Errors */
-	net_stats->outputErrors = (u32)(adapter->stats.ecol + adapter->stats.latecol);
+	net_stats->outputErrors = (u32)(adapter->stats.ecol + adapter->stats.latecol +
+        adapter->netdev->dbg.tx_drop + adapter->netdev->dbg.tx_map_fail);
 	ether_stats->dot3StatsEntry.deferredTransmissions = (u32)adapter->stats.ecol;
 	ether_stats->dot3StatsEntry.lateCollisions = (u32)adapter->stats.latecol;
 	ether_stats->dot3StatsEntry.carrierSenseErrors = (u32)adapter->stats.tncrs;
@@ -7359,7 +7364,6 @@ static bool igb_cleanup_headers(struct igb_ring *rx_ring,
 	if (unlikely((igb_test_staterr(rx_desc,
 								   E1000_RXDEXT_ERR_FRAME_ERR_MASK)))) {
         AppleIGB* netdev = (AppleIGB*)rx_ring->netdev;
-        netdev->getNetStats()->inputErrors += 1;
 		netdev->freePacket(skb);
 		return true;
 	}
@@ -7497,6 +7501,10 @@ static bool igb_clean_rx_irq(struct igb_q_vector *q_vector, int budget)
 	
 	rx_ring->rx_stats.packets += total_packets;
 	rx_ring->rx_stats.bytes += total_bytes;
+
+	/* hand the queued packets to the stack in one batch */
+	if (total_packets)
+		rx_ring->netdev->flushInput();
 	q_vector->rx.total_packets += total_packets;
 	q_vector->rx.total_bytes += total_bytes;
 	
@@ -10369,16 +10377,10 @@ UInt32 AppleIGB::outputPacket(mbuf_t skb, void * param)
         if (txNumFreeDesc < MAX_SKB_FRAGS + 3 //igb_maybe_stop_tx
             || stalled) /** even if we have free desc we should exit in stalled mode as queue is enabled by threadsafe interrupts -> native igb code (see igb_poll) */
         {
-            /* this is a hard error */
-			netStats->outputErrors += 1;
-#ifdef DEBUG
-            if (netStats->outputErrors % 100 == 0)
-                pr_debug("output: Dropping packets (%u), free\n", netStats->outputErrors);
-#endif
+            /* Not an error: the gated output queue keeps the packet and retries
+             * after igb_clean_tx_irq wakes the queue. Counted in dbg.tx_stall only. */
             result = kIOReturnOutputStall;
             dbg.tx_stall++;
-            if (!stalled)
-                dbgEvent(kDbgEvTxStall, (UInt32)txNumFreeDesc);
             stalled = true;
             goto done;
         }
@@ -10431,8 +10433,7 @@ UInt32 AppleIGB::outputPacket(mbuf_t skb, void * param)
             igb_tx_csum(tx_ring, first);
 
         if(!igb_tx_map(tx_ring, first, hdr_len)){
-			netStats->outputErrors += 1;
-            pr_debug("output: igb_tx_map failed (%u)\n", netStats->outputErrors);
+            pr_debug("output: igb_tx_map failed (%u)\n", dbg.tx_map_fail + 1);
             /* nothing was mapped: clear the slot so igb_clean_tx_ring cannot free this mbuf a second time */
             first->skb = NULL;
             first->next_to_watch = NULL;
@@ -11262,7 +11263,6 @@ UInt32 AppleIGB::getFeatures() const {
 void AppleIGB::startTxQueue()
 {
     dbg.tx_wake++;
-    dbgEvent(kDbgEvTxWake, stalled ? 1 : 0);
     DEBUGFUNC("AppleIGB::startTxQueue\n");
     if (likely(stalled && txMbufCursor && transmitQueue)) {
         pr_debug("Assuming wake queue called.\n");
@@ -11328,7 +11328,15 @@ void AppleIGB::setCarrier(bool stat)
 	
 void AppleIGB::receive(mbuf_t skb)
 {
-	netif->inputPacket(skb, mbuf_pkthdr_len(skb));
+	/* Queue and deliver in batches from flushInput(): the family then accounts
+	 * input packets/bytes for ifnet (with immediate delivery netstat Ipkts stayed 0). */
+	netif->inputPacket(skb, mbuf_pkthdr_len(skb), IONetworkInterface::kInputOptionQueuePacket);
+}
+
+void AppleIGB::flushInput()
+{
+	if (netif)
+		netif->flushInputQueue();
 }
 
 void AppleIGB::setVid(mbuf_t skb, UInt16 vid)
