@@ -10,7 +10,7 @@ Bundle id stays `com.amdosx.driver.AppleIGB`; installed on the EFI as `AppleIGB-
 | 5 | 5.11.41 | + MBUF_DONTWAIT | IPv4 stalls after ~3 min |
 | 6 | 5.11.42 | + IOLog counters | dropouts after 2.5 min; logs undecodable |
 | 7 | 5.11.43 | + IORegistry counters | clean 10 min; stalled again on Oct 24 (3x) |
-| 9 | 5.12.1 | accounting fixes on top of 5.12.0: no TX stall/wake events in the ring, monotonic Ierrs/Oerrs, queued RX delivery so Ipkts counts | built 2026-10-25 (SHA-256 e9bff8d6…); not yet installed |
+| 9 | 5.12.1 | accounting fixes on top of 5.12.0: no TX stall/wake events in the ring, monotonic Ierrs/Oerrs, queued RX delivery so Ipkts counts | installed on the EFI 2026-10-25 00:4x (SHA-256 e9bff8d6…); backup `EFI/OC/AppleIGB-Tahoe-5.12.0.kext.bak`; result pending |
 | 8 | 5.12.0 | **MSI interrupts** (was legacy INTx), event ring, latent RX/TX fixes | **clean**: 60 min (2026-10-24 23:16 to 00:16), MSI active, 1.53 M interrupts, 3.9 M RX / 1.36 M TX packets, 2 sleep/wake cycles, 0 router ARP failures in the Tahoe log, all error counters 0; only isolated 1-s ping misses under load |
 
 ## 5.12.1 (test 9)
