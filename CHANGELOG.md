@@ -31,3 +31,8 @@ Bundle id stays `com.amdosx.driver.AppleIGB`; installed on the EFI as `AppleIGB-
 - Heavy traffic in test 8 went over IPv6 (3.85 M of 3.9 M RX packets); IPv4 under load is still untested.
 - Cosmetic issues to fix in 5.12.1 (no behaviour change): the `AppleIGB-Events` ring is flooded by TX_STALL/TX_WAKE pairs under TX saturation (keep the counters, drop the events); `netstat` shows Oerrs as multiples of 2^32 because `igb_update_stats` overwrites `outputErrors` with a smaller value each second (IONetworkInterface treats the decrease as a 32-bit wrap); Ipkts/Ibytes stay 0 because `inputPackets` is never reported.
 - Optional A/B later: boot once with `igb-intx=1` in boot-args to confirm the stall returns on the legacy interrupt line.
+
+### EFI housekeeping (2026-10-25)
+- Full EFI backup in `~/Desktop/EFI-backup-20261025-1328` (70 MB, 328 files, verified with diff).
+- Removed `AppleIGB-Tahoe-5.11.{8,40,41,42,43}.kext.bak` and 111 `opencore-*.txt` debug logs; kept `AppleIGB-Tahoe-5.12.0.kext.bak` and the config.plist backups. Free space 25 MB -> 55 MB.
+- Still open: `Misc -> Debug -> Target` is 67 (writes a 256 KB log per boot); set it to 3 together with the stale kext comment, with a config.plist backup and ocvalidate.
