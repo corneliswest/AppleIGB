@@ -1,158 +1,85 @@
-# AppleIGB — Tahoe-Compatible Fork
+# AppleIGB (MSI build) — Intel I210/I211/I350 driver for macOS Tahoe
 
-Intel onboard LAN driver for macOS, patched to fix kernel panics on **macOS 26.x (Tahoe)**.
+A fork of the AppleIGB kext (Intel `igb` Linux driver ported to macOS) that fixes the
+**"Ethernet works for a few minutes, then no traffic at all"** stall seen on macOS 26 Tahoe,
+in particular with the Intel I211-AT on AMD X570 boards.
 
-This fork fixes four bugs in the original Apple-specific driver code that caused repeated kernel panics on macOS Tahoe 26.x due to stricter mbuf validity checks, Probabilistic GZAlloc (PGZ) guard pages, and a changed output queue threading model introduced in that release.
+Status: tested on one machine (Gigabyte X570 Aorus Pro, Ryzen 9 5900X, I211-AT, OpenCore 1.0.8,
+macOS 26.7.1). Two instrumented one-hour runs plus about 12 hours of daily use with 46 sleep/wake
+cycles without a stall, where every earlier build stalled within minutes. More testers welcome:
+please open an issue with your board, NIC, macOS version and the output of the diagnostics below.
 
----
+## What was wrong
 
-## Supported Devices
+Every AppleIGB build so far (hnak, Shaneee, donatengit 5.11.4, ayushere 5.11.5–5.11.8) ran on the
+**legacy INTx interrupt line**: the code that selects the MSI vector sat behind `#ifdef MSIX_ENABLED`,
+which the Xcode project never defined. On this hardware the shared, level-triggered INTx line
+eventually stops delivering interrupts, and because the driver never polls, RX and TX stop at the
+same time. macOS notices through ARP first (`configd: Process router ARP failure: en0`), so it
+looks like an IPv4 problem, but IPv6 connections fail just as hard.
 
-| Family | PCI IDs |
-|---|---|
-| 82575 | 0x10A7, 0x10A9, 0x10D6 |
-| 82576 | 0x10C9, 0x10E6, 0x10E7, 0x10E8, 0x1526, 0x150A, 0x1518, 0x150D |
-| 82580 | 0x150E, 0x150F, 0x1510, 0x1511, 0x1516, 0x1527 |
-| dh89xxcc | 0x0438, 0x034A, 0x043C, 0x0440 |
-| **I210 / I211** | 0x1533, 0x1534, 0x1535, 0x1536, 0x1537, 0x1538, 0x1539, 0x157B, 0x157C |
-| I350 | 0x1521, 0x1522, 0x1523, 0x1524, 0x1546 |
-| I354 | 0x1F40, 0x1F41, 0x1F45 |
+The sibling driver AppleIGC (Intel I225/I226) fixed the same symptom the same way
+([SongXiaoXi/AppleIGC PR 38](https://github.com/SongXiaoXi/AppleIGC/pull/38)).
 
----
+## What this fork changes
 
-## What Was Fixed
+- **MSI interrupts.** `initEventSources()` picks the first PCI message-signalled interrupt vector;
+  legacy INTx remains the fallback. The `INT_ASSERTED` gate in the interrupt handler applies only
+  in INTx mode. Boot-arg `igb-intx=1` forces the old line so both modes can be compared with the
+  same binary (read from `IODeviceTree:/options`, no extra kernel KPI).
+- **Interrupt handler always services the rings** (`igb_poll`) before handling link-change bits.
+- **Diagnostics in the IORegistry.** `AppleIGB-DBG` (counters: interrupts, polls, watchdog ticks,
+  RX/TX per ethertype, drops, checksum status, hardware MAC statistics, ring state) and
+  `AppleIGB-Events` (last 128 events with wall-clock time: link changes, restarts, resets, hangs).
+- **Latent panic fixes:** a failed `mbuf_copyback` in RX now discards the rest of that frame and
+  recycles the DMA page (before: NULL page left in the ring); `allocatePacket()` NULL is handled;
+  the TX slot is cleared when `igb_tx_map` fails (before: possible double free).
+- **Accounting:** interface error counters are monotonic (netstat no longer shows Oerrs as
+  multiples of 2^32), a TX queue stall is not counted as an error, RX packets are delivered in
+  batches (`kInputOptionQueuePacket` + `flushInputQueue`).
+- Everything from [ayushere v5.11.8](https://github.com/ayushere/AppleIGB) is kept: IPv6
+  extension-header bounds checks, `MBUF_DONTWAIT` RX copy, TX ring lock.
 
-### Bug 1 — TX path mbuf out-of-bounds (panics on Tahoe 26.4 and 26.5)
+Full history: [CHANGELOG.md](CHANGELOG.md). The previous README (ayushere) is in
+[docs/README-ayushere-5.11.8.md](docs/README-ayushere-5.11.8.md).
 
-**Affected functions:** `tcp6_hdr()`, `igb_tx_csum()`
+## Supported devices
 
-Both functions walked IPv6 extension headers by doing `ip6++`, which advances by `sizeof(struct ip6_hdr) = 40 bytes`. Real IPv6 extension headers have variable lengths with the format `{next_hdr, hdr_ext_len, ...}` where the actual byte length is `(hdr_ext_len + 1) * 8`. The incorrect stride caused the pointer to walk past the end of the mbuf's data region.
+The personalities are unchanged from upstream: 82575, 82576, 82580, DH89xxCC, I210/I211
+(0x1533–0x1539, 0x157B, 0x157C), I350, I354. Only the I211-AT (0x1539) has been tested with this build.
 
-On macOS Tahoe, Probabilistic GZAlloc places a guard page immediately after each 512-byte mbuf zone element. The errant read hit that guard page and triggered a kernel panic:
+## Install (OpenCore)
 
-```
-panic: Kernel trap at ..., type=14 (page fault)
-Zone: mbuf, Kind: out-of-bounds (high confidence), Access: 29 byte(s) past
-Kernel Extensions in backtrace: com.amdosx.driver.AppleIGB(5.11.4)
-```
-
-**Fix:** Replaced the `ip6++` loop with proper bounds-checked extension header traversal using the correct `(cursor[1] + 1) * 8` stride.
-
-### Bug 2 — RX path silent mbuf corruption (panic: `mbuf len -3`)
-
-**Affected function:** `igb_add_rx_frag()`
-
-`mbuf_copyback()` was called with `MBUF_WAITOK` in the RX interrupt context (incorrect — sleeping is not allowed in interrupt context). When the call failed, the function logged an error but returned `true` (success) anyway, handing a partially-corrupted mbuf up to the network stack. Tahoe's stricter mbuf validity check then caught the corrupted length field and panicked:
-
-```
-panic: Failed mbuf validity check: mbuf len -3 type 1 flags 0x2 rcvif en6
-```
-
-**Fix:** Changed to `MBUF_DONTWAIT`, and on failure the mbuf is freed and `NULL` is returned to the caller so the descriptor is dropped cleanly.
-
----
-
-## Installation (OpenCore)
-
-### Prerequisites
-
-- OpenCore bootloader
-- SIP disabled (required for third-party kexts)
-- macOS Tahoe 26.x (for older macOS use the [original upstream](https://github.com/Shaneee/AppleIGB))
-
-### Steps
-
-1. **Download** `AppleIGB.kext` from the [Releases](../../releases/latest) page.
-
-2. **Mount your EFI partition:**
-   ```bash
-   sudo diskutil mount disk0s1
-   ```
-   *(replace `disk0s1` with your EFI partition — check with `diskutil list`)*
-
-3. **Back up your existing kext:**
-   ```bash
-   cp -r /Volumes/EFI/EFI/OC/Kexts/AppleIGB.kext ~/Desktop/AppleIGB.kext.bak
-   ```
-
-4. **Replace with the patched kext:**
-   ```bash
-   sudo rm -rf /Volumes/EFI/EFI/OC/Kexts/AppleIGB.kext
-   sudo cp -r ~/Downloads/AppleIGB.kext /Volumes/EFI/EFI/OC/Kexts/
-   sudo chown -R 0:0 /Volumes/EFI/EFI/OC/Kexts/AppleIGB.kext
-   ```
-
-5. **Unmount EFI and reboot:**
-   ```bash
-   sudo diskutil unmount /Volumes/EFI
-   sudo reboot
-   ```
-
-No `config.plist` changes are needed — the bundle identifier (`com.amdosx.driver.AppleIGB`) and kext name are unchanged.
-
-### Verify it loaded
-
-After reboot:
-```bash
-kextstat | grep AppleIGB
-```
-You should see `com.amdosx.driver.AppleIGB (5.11.5)`.
-
----
-
-## Building from Source
-
-Requires Xcode 14 or later. macOS Tahoe SDK (Xcode 26+) recommended.
+1. Download `AppleIGB-<version>.kext.zip` from Releases and check the SHA-256 in the `.sha256` file.
+2. Put `AppleIGB.kext` in `EFI/OC/Kexts` and add it to `Kernel → Add` like any other kext. The bundle
+   identifier is still `com.amdosx.driver.AppleIGB`, so it is a drop-in replacement for an existing
+   AppleIGB entry. If you keep an older AppleIGB for Sequoia, give that entry `MaxKernel 24.99.99`
+   and this one `MinKernel 25.0.0` (that is how the test machine runs).
+3. Reboot. Check with:
 
 ```bash
-git clone https://github.com/ayushere/AppleIGB.git
-cd AppleIGB
-xcodebuild -scheme AppleIGB -configuration Release CODE_SIGN_IDENTITY="-"
+kmutil showloaded | grep AppleIGB
+ioreg -r -c AppleIGB -l | grep -o '"irq_mode"=[0-9]*'      # 1 = MSI, 0 = legacy INTx
+ioreg -r -c AppleIGB -l | grep -E 'AppleIGB-(DBG|Events)'
 ```
 
-Output: `~/Library/Developer/Xcode/DerivedData/AppleIGB-.../Build/Products/Release/AppleIGB.kext`
+A one-hour recorder script for Tahoe is in `scripts/record-tahoe.command` (pings, ARP state,
+interface counters, driver counters every 2 s into `~/Desktop/igb-rec-<date>.txt`).
 
----
+## Build
 
-## Changelog
-
-### v5.11.6 — 2026-05-16
-- Fixed TX ring use-after-free race between `outputPacket()` and `igb_clean_tx_irq()`
-- Root cause: on Tahoe 26.x, `IOBasicOutputQueue` delivers `outputPacket` from a separate high-priority thread instead of the workloop; `igb_clean_tx_irq` runs on the workloop — without a lock they race on the TX ring, freeing an mbuf while `outputPacket` still holds it
-- Fix: added `IOSimpleLock` (txLock) protecting the TX buffer write-map section in `outputPacket` and the buffer-free section in `igb_clean_tx_irq`
-- Same pattern as the locking fix applied in IntelMausiEthernet for the same Tahoe threading change
-
-### v5.11.5 — 2026-05-15
-- Fixed `tcp6_hdr()`: replaced unbounded `ip6++` traversal with correct bounds-checked IPv6 extension header walking using `(cursor[1] + 1) * 8` stride
-- Fixed `igb_tx_csum()`: same IPv6 extension header traversal fix; added early return on malformed packet
-- Fixed `igb_add_rx_frag()`: changed `MBUF_WAITOK` → `MBUF_DONTWAIT`; on `mbuf_copyback` failure, now frees the mbuf and returns `NULL` instead of passing a corrupted mbuf to the stack
-- Built against macOS 26.5 SDK (Xcode 26.5)
-
-### v5.11.4 — 2022-08-27 *(upstream — Shaneee/donatengit)*
-- Updated to Intel IGB Linux driver source v5.11.4
-- Adopted IntelMausi link management and code structure
-- Added EEE mode toggle option
-- Explicit TX queue stall on busy transmit
-
----
+Xcode 26 (the Command Line Tools cannot build kexts): `./build.sh 5.12.1` writes
+`dist/AppleIGB-5.12.1.kext` (x86_64) and prints its SHA-256. The script expects Xcode at
+`/Users/cw/Downloads/Xcode.app`; set `XCODE_APP=/Applications/Xcode.app` if yours is elsewhere.
 
 ## Credits
 
-- **Intel** — original `igb` Linux kernel driver source (v5.11.4)
-- **hnak** ([InsanelyMac](https://www.insanelymac.com/forum/topic/273073-appleigbkext/)) — original macOS port of the IGB driver
-- **Shanee** ([Shaneee/AppleIGB](https://github.com/Shaneee/AppleIGB)) — update to IGB v5.11.4, macOS kext structure
-- **donatengit** ([donatengit/AppleIGB](https://github.com/donatengit/AppleIGB)) — IntelMausi code structure merge, EEE support, stability improvements
-- **ayushere** — macOS Tahoe 26.x compatibility fixes (v5.11.5)
-
----
-
-## Known Issues (inherited from upstream)
-
-- Instability and connection drops reported on X570 and TRX40 motherboards — use SmallTree or USB Ethernet on those platforms
-- Does not use MSI-X interrupts
-
----
+- Intel — `igb` Linux driver (5.11.4) and shared `e1000_*` code
+- hnak — original macOS port (InsanelyMac)
+- [Shaneee](https://github.com/Shaneee/AppleIGB), [donatengit](https://github.com/donatengit/AppleIGB) — 5.11.4 update, IntelMausi-style link management
+- [ayushere](https://github.com/ayushere/AppleIGB) — Tahoe panic fixes (5.11.5–5.11.8)
+- [SongXiaoXi/AppleIGC](https://github.com/SongXiaoXi/AppleIGC) — the MSI diagnosis on the sibling I225 driver
 
 ## License
 
-The Intel IGB driver source is released under the GNU General Public License v2. This project inherits that license.
+GPL-2.0, inherited from the Intel `igb` driver and the earlier ports. See [LICENSE](LICENSE).
