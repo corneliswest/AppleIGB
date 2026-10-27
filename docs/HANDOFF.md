@@ -1,7 +1,7 @@
 # Handoff — AppleIGB eigen build (stand 25 oktober 2026)
 
 ## Waar staat wat
-- Repo: `~/Desktop/AppleIGB-build/own` (zelfde kopie op Sequoia en Tahoe), publiek op https://github.com/corneliswest/AppleIGB (branch `main`, tags `v5.12.0`, `v5.12.1`, release v5.12.1 met zip + SHA-256). Commits zonder Claude-vermelding, e-mail `corneliswest@users.noreply.github.com`.
+- Repo: `~/Desktop/AppleIGB-build/own` (zelfde kopie op Sequoia en Tahoe), publiek op https://github.com/corneliswest/AppleIGB (branch `main`, tags `v5.12.0`, `v5.12.1`, release v5.12.1 met zip + SHA-256). Commits op naam Cornelis, e-mail `corneliswest@users.noreply.github.com`, zonder co-auteurs of tool-vermeldingen.
 - EFI (disk0s1, 2 TB Samsung): `EFI/OC/Kexts/AppleIGB-Tahoe.kext` = **5.12.1** (MinKernel 25.0.0), `AppleIGB.kext` = 5.11.4 voor Sequoia (MaxKernel 24.99.99). Terugvaloptie `EFI/OC/AppleIGB-Tahoe-5.12.0.kext.bak`. Volledige EFI-back-up: `~/Desktop/EFI-backup-20261025-1328` (Tahoe- en Sequoia-bureaublad kunnen verschillen; de back-up staat op het volume waar hij gemaakt is).
 - Mounten (gebruiker typt wachtwoord): `sudo diskutil mount disk0s1` → `/Volumes/NO NAME`. Installeren: `scripts/install-efi.sh dist/AppleIGB-<versie>.kext` (back-up, hashcontrole, ontkoppelen; raakt config.plist niet aan).
 - Xcode: op Sequoia `~/Downloads/Xcode.app` (26.6). Op Tahoe staan `~/Downloads/Xcode_26.6_Universal.xip` en `Xcode_26.3_Universal.xip`; uitpakken en `XCODE_APP=/pad/naar/Xcode.app ./build.sh <versie>`.
