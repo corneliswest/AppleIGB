@@ -104,9 +104,15 @@ static void kfree(void* p, size_t size)
 }
 
 
+/* Linux vmalloc memory is wired. The port used IOMallocPageable here, so the
+ * tx_buffer_info / rx_buffer_info arrays could be paged out under memory
+ * pressure. outputPacket() writes tx_buffer_info while holding txLock (an
+ * IOSimpleLock, preemption disabled) and vm_fault() refuses to page in with
+ * preemption disabled (returns KERN_FAILURE), which panicked in outputPacket
+ * (+0x112, "PL: 1, VF: 5") three times on 2026-10-27. Wired memory fixes it. */
 static void* vzalloc(size_t size)
 {
-	void* p = IOMallocPageable(size, PAGE_SIZE);
+	void* p = IOMalloc(size);
 	if(p){
 		bzero(p, size);
 	} else {
@@ -117,7 +123,8 @@ static void* vzalloc(size_t size)
 
 static void vfree(void* p, size_t size)
 {
-	IOFreePageable(p, size);
+	if (p)
+		IOFree(p, size);
 }
 
 static void netif_carrier_off(IOEthernetController* netdev){
