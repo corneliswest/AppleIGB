@@ -1,14 +1,20 @@
 #!/bin/zsh
-# Install a built kext as the Tahoe kext (AppleIGB-Tahoe.kext) on the OpenCore EFI of the 2 TB (disk0s1).
+# Install a built kext as the Tahoe kext (AppleIGB-Tahoe.kext) on the OpenCore EFI of the 2 TB Samsung,
+# i.e. the EFI partition of the disk that holds the running APFS container (disk0s1 or disk1s1: the
+# numbering changes between boots, so it is derived here instead of hardcoded).
 # Only the kext bundle is replaced; config.plist is not touched. The previous kext is kept as
 # EFI/OC/AppleIGB-Tahoe-<oldversion>.kext.bak (outside Kexts, so OpenCore ignores it).
-# Mount first (you type the password):  sudo diskutil mount disk0s1
+# Mount first (you type the password):  sudo diskutil mount <efi-device>   (printed by this script if not mounted)
 # Usage: scripts/install-efi.sh dist/AppleIGB-5.12.0.kext
 set -euo pipefail
 K="${1:?usage: install-efi.sh <kext>}"
 [ -f "$K/Contents/MacOS/AppleIGB" ] || { echo "not a kext: $K"; exit 1; }
-EFI=$(mount | sed -n 's|^/dev/disk0s1 on \(.*\) (msdos.*|\1|p')
-[ -n "$EFI" ] || { echo "The EFI of disk0s1 is not mounted. Run: sudo diskutil mount disk0s1"; exit 1; }
+CONTAINER=$(diskutil info / | awk '/Part of Whole/{print $4}')
+DISK=$(diskutil info "$CONTAINER" | awk '/APFS Physical Store/{print $4}' | sed -E 's/s[0-9]+$//')
+EFIDEV=$(diskutil list "$DISK" | awk '$2=="EFI"{print $NF; exit}')
+[ -n "$EFIDEV" ] || { echo "no EFI partition found on $DISK (container $CONTAINER)"; exit 1; }
+EFI=$(mount | sed -n "s|^/dev/$EFIDEV on \(.*\) (msdos.*|\1|p")
+[ -n "$EFI" ] || { echo "The EFI $EFIDEV of $DISK is not mounted. Run: sudo diskutil mount $EFIDEV"; exit 1; }
 OC="$EFI/EFI/OC"; CFG="$OC/config.plist"; DST="$OC/Kexts/AppleIGB-Tahoe.kext"
 [ -f "$CFG" ] || { echo "no config.plist at $CFG"; exit 1; }
 [ -d "$DST" ] || { echo "no $DST on the EFI"; exit 1; }
