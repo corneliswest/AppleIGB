@@ -10,7 +10,7 @@ Bundle id stays `com.amdosx.driver.AppleIGB`; installed on the EFI as `AppleIGB-
 | 5 | 5.11.41 | + MBUF_DONTWAIT | IPv4 stalls after ~3 min |
 | 6 | 5.11.42 | + IOLog counters | dropouts after 2.5 min; logs undecodable |
 | 7 | 5.11.43 | + IORegistry counters | clean 10 min; stalled again on Oct 24 (3x) |
-| 10 | 5.12.2 | **wired TX/RX buffer arrays** (`vzalloc` was `IOMallocPageable`) | pending |
+| 10 | 5.12.2 | **wired TX/RX buffer arrays** (`vzalloc` was `IOMallocPageable`) | **clean**: ~35 h over three boots (2026-10-27 15:47 to 10-28 12:00, 12:00 to 22:56, 22:56 onwards; both restarts were deliberate, shutdown cause 5), swap in use the whole time (1.2 GB of 2 GB at the check), no panic; at 3.6 h into the third boot 14 M packets (9.5 M RX / 4.5 M TX IPv6), 4 M interrupts, all error counters 0, no reinit. 5.12.1 panicked within 1.3 to 2.9 h on three of four boots under the same load |
 | 9 | 5.12.1 | accounting fixes on top of 5.12.0: no TX stall/wake events in the ring, monotonic Ierrs/Oerrs, queued RX delivery so Ipkts counts | **clean**: recorder 01:08-02:08 (3326 samples, 3 v4 / 2 v6 single misses, IPv4-heavy: 483 k of 858 k RX packets), then 10.5 h of use with 44 sleep/wake cycles until 12:34, 0 router ARP failures, all error counters 0; Oerrs sane (9); Ipkts still 0 (IONetworkInterface passes the counts to ifnet_input_extended, so the cause is in the kernel accounting, not the driver) |
 | 8 | 5.12.0 | **MSI interrupts** (was legacy INTx), event ring, latent RX/TX fixes | **clean**: 60 min (2026-10-24 23:16 to 00:16), MSI active, 1.53 M interrupts, 3.9 M RX / 1.36 M TX packets, 2 sleep/wake cycles, 0 router ARP failures in the Tahoe log, all error counters 0; only isolated 1-s ping misses under load |
 
